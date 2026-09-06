@@ -7,5 +7,7 @@
   "scripts": {
     "start": "node server.cjs"
   },
-  "dependencies": {}
+ "dependencies": {
+  "node-ecole-directe": "1.3.4"
+}
 }
