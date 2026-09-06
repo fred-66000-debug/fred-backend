@@ -153,7 +153,11 @@ async function fetchEcoleDirecteCahier(username, password, studentIndex) {
     error.students = students.map((entry, index) => ({ index, name: [entry.prenom, entry.nom].filter(Boolean).join(" ") || `Élève ${index + 1}`, className: entry.classe || "" }));
     throw error;
   }
-  const token = login.token;
+  let token = login.token;
+  if (account.typeCompte === "1" || account.typeCompte === "2") {
+    const contact = await ecoleDirectePost("/contactetablissement.awp?verbe=get&", {}, token).catch(() => null);
+    if (contact && contact.token) token = contact.token;
+  }
   const calendarResponse = await ecoleDirectePost(`/Eleves/${student.id}/cahierdetexte.awp?verbe=get&`, {}, token);
   const days = Object.keys((calendarResponse && calendarResponse.data) || {}).filter(isISODate)
     .filter(day => day >= new Date(Date.now() - 86400000).toISOString().slice(0, 10)).sort().slice(0, 45);
