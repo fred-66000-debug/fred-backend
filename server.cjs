@@ -1,9 +1,9 @@
 const http = require("node:http");
-const EcoleDirecte = require("node-ecole-directe");
 
 const PORT = Number(process.env.PORT || 3000);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
+const ECOLE_DIRECTE_BASE = "https://api.ecoledirecte.com/v3";
 const RATE_WINDOW_MS = 10 * 60 * 1000;
 const RATE_MAX = 12;
 const attempts = new Map();
@@ -100,27 +100,73 @@ async function extractTasks(sourceText, today, fileData) {
   if (!response.ok) throw new Error("openai-failed");
   return JSON.parse(textFromResponse(await response.json())).items || [];
 }
+function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function isRetryableEcoleDirecteError(error) {
+  return /ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|network|timeout|temporarily/i.test(String(error && (error.code || error.message || error)));
+}
+async function ecoleDirectePost(path, payload, token) {
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15_000);
+    try {
+      const data = { ...payload, ...(token ? { token } : {}) };
+      const response = await fetch(ECOLE_DIRECTE_BASE + path, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8", "User-Agent": "fred-school-planner/1.0" },
+        body: "data=" + encodeURIComponent(JSON.stringify(data)),
+        signal: controller.signal
+      });
+      if (!response.ok) throw new Error(`ecole-directe-http-${response.status}`);
+      return await response.json();
+    } catch (error) {
+      lastError = error;
+      if (attempt === 2 || !isRetryableEcoleDirecteError(error)) break;
+      await wait(450 * (attempt + 1));
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  const error = new Error("ecole-directe-unavailable");
+  error.cause = lastError;
+  throw error;
+}
+function studentFromEcoleDirecteData(entry) {
+  return {
+    id: entry.id,
+    prenom: entry.prenom || "",
+    nom: entry.nom || "",
+    classe: entry.profile && entry.profile.classe ? entry.profile.classe.libelle : (entry.classe && entry.classe.libelle) || ""
+  };
+}
 async function fetchEcoleDirecteCahier(username, password, studentIndex) {
-  const session = new EcoleDirecte.Session();
-  const account = await session.connexion(username, password);
-  const students = account.eleves || [account];
+  const login = await ecoleDirectePost("/login.awp", { identifiant: username, motdepasse: password });
+  if (!login || !login.token || !login.data || !Array.isArray(login.data.accounts)) throw new Error("invalid-credentials");
+  const account = login.data.accounts[0];
+  const rawStudents = (account.typeCompte === "1" || account.typeCompte === "2")
+    ? (((account.profile || {}).eleves) || [])
+    : [account];
+  const students = rawStudents.map(studentFromEcoleDirecteData).filter(student => student.id);
   const student = students[studentIndex];
   if (!student) {
     const error = new Error("choose-student");
     error.students = students.map((entry, index) => ({ index, name: [entry.prenom, entry.nom].filter(Boolean).join(" ") || `Élève ${index + 1}`, className: entry.classe || "" }));
     throw error;
   }
-  const calendar = await student.fetchCahierDeTexte();
-  const days = calendar.map(entry => entry.day).filter(isISODate).filter(day => day >= new Date(Date.now() - 86400000).toISOString().slice(0, 10)).sort().slice(0, 45);
+  const token = login.token;
+  const calendarResponse = await ecoleDirectePost(`/Eleves/${student.id}/cahierdetexte.awp?verbe=get&`, {}, token);
+  const days = Object.keys((calendarResponse && calendarResponse.data) || {}).filter(isISODate)
+    .filter(day => day >= new Date(Date.now() - 86400000).toISOString().slice(0, 10)).sort().slice(0, 45);
   const blocks = [];
   for (const day of days) {
-    const entries = await student.fetchCahierDeTexteJour(day);
-    const content = flatten(entries);
+    const dayResponse = await ecoleDirectePost(`/Eleves/${student.id}/cahierdetexte/${day}.awp?verbe=get&`, {}, token);
+    const content = flatten((dayResponse && dayResponse.data && dayResponse.data.matieres) || {});
     if (content) blocks.push(`Échéance : ${day}\n${content}`);
   }
   const start = new Date();
   const end = new Date(Date.now() + 6 * 86400000);
-  const timetable = await student.fetchEmploiDuTemps(start.toISOString().slice(0, 10), end.toISOString().slice(0, 10)).catch(() => []);
+  const timetableResponse = await ecoleDirectePost(`/E/${student.id}/emploidutemps.awp?verbe=get&`, { dateDebut: start.toISOString().slice(0, 10), dateFin: end.toISOString().slice(0, 10) }, token).catch(() => ({ data: [] }));
+  const timetable = timetableResponse.data || [];
   return { name: [student.prenom, student.nom].filter(Boolean).join(" "), className: student.classe || "", text: blocks.join("\n\n"), schedule: normalizeSchedule(timetable) };
 }
 
@@ -147,7 +193,8 @@ const server = http.createServer(async (request, response) => {
     send(response, 404, { error: "Route introuvable." });
   } catch (error) {
     if (error.message === "choose-student") { send(response, 409, { error: "Choisis un élève.", students: error.students }); return; }
-    if (error === "Invalid credentials" || error.message === "Invalid credentials") { send(response, 401, { error: "Identifiant ou mot de passe École Directe incorrect." }); return; }
+    if (error === "Invalid credentials" || error.message === "Invalid credentials" || error.message === "invalid-credentials") { send(response, 401, { error: "Identifiant ou mot de passe École Directe incorrect." }); return; }
+    if (error.message === "ecole-directe-unavailable") { send(response, 503, { error: "École Directe ne répond pas pour le moment. Réessaie dans une minute." }); return; }
     console.error("fred backend error", error.message);
     send(response, 502, { error: "La synchronisation est indisponible. Réessaie dans un instant." });
   }
