@@ -1,0 +1,13 @@
+{
+  "name": "fred-ai-backend",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.cjs"
+  },
+  "dependencies": {
+    "node-ecole-directe": "1.3.4"
+  }
+}
