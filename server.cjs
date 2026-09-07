@@ -257,7 +257,8 @@ async function analyseTimetable(images, kind) {
     return { courses: Array.isArray(parsed.courses) ? parsed.courses : [], assessments: Array.isArray(parsed.assessments) ? parsed.assessments : [] };
   } finally { clearTimeout(timeout); }
 }
-\nconst server = http.createServer(async (request, response) => {
+
+const server = http.createServer(async (request, response) => {
   if (request.method === "OPTIONS") { response.writeHead(204, headers()); response.end(); return; }
   if (request.method !== "POST") { send(response, 404, { error: "Route introuvable." }); return; }
   if (rateLimited(request)) { send(response, 429, { error: "Trop de tentatives. Réessaie dans quelques minutes." }); return; }
