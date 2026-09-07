@@ -207,7 +207,57 @@ async function fetchEcoleDirecteCahier(username, password, studentIndex) {
   return { name: [student.prenom, student.nom].filter(Boolean).join(" "), className: student.classe || "", text: blocks.join("\n\n"), schedule: normalizeSchedule(timetable) };
 }
 
-const server = http.createServer(async (request, response) => {
+
+const TIMETABLE_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["courses", "assessments"],
+  properties: {
+    courses: { type: "array", maxItems: 80, items: { type: "object", additionalProperties: false, required: ["day", "subject", "start", "end", "rule", "room"], properties: {
+      day: { type: "integer", minimum: 1, maximum: 7 },
+      subject: { type: "string", minLength: 1, maxLength: 80 },
+      start: { type: "string", pattern: "^\\d{2}:\\d{2}$" },
+      end: { type: "string", pattern: "^\\d{2}:\\d{2}$" },
+      rule: { type: "string", enum: ["every", "a", "b"] },
+      room: { type: "string", maxLength: 80 }
+    } } },
+    assessments: { type: "array", maxItems: 40, items: { type: "object", additionalProperties: false, required: ["subject", "dateText", "details"], properties: {
+      subject: { type: "string", minLength: 1, maxLength: 80 },
+      dateText: { type: "string", minLength: 1, maxLength: 80 },
+      details: { type: "string", maxLength: 180 }
+    } } }
+  }
+};
+function validTimetableImages(images) {
+  if (!Array.isArray(images) || images.length < 1 || images.length > 12) return false;
+  let total = 0;
+  return images.every(image => {
+    if (typeof image !== "string" || !/^data:image\/(jpeg|png|webp);base64,/i.test(image)) return false;
+    total += image.length;
+    return image.length <= 1_500_000 && total <= 9_500_000;
+  });
+}
+async function analyseTimetable(images, kind) {
+  if (!OPENAI_API_KEY) throw new Error("missing-openai-key");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 25_000);
+  try {
+    const prompt = kind === "assessments"
+      ? "Lis uniquement le planning de devoirs surveillés ou contrôles. Retourne chaque DS dans assessments, avec matière, date affichée telle qu'elle est écrite et détail éventuel. Ne remplis pas courses. N'invente jamais une date ou matière absente."
+      : "Lis uniquement les grilles d'emploi du temps. Retourne chaque cours dans courses. day : lundi=1 à dimanche=7. start/end au format HH:mm. rule vaut every, a ou b. Utilise a ou b seulement si l'image l'indique clairement ; sinon every. Ne devine jamais un cours, une salle ou une alternance. Ne remplis pas assessments.";
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST", signal: controller.signal,
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: OPENAI_MODEL, store: false, max_output_tokens: 500,
+        input: [{ role: "user", content: [{ type: "input_text", text: prompt }, ...images.map(image_url => ({ type: "input_image", image_url, detail: "high" }))] }],
+        text: { format: { type: "json_schema", name: "fred_timetable", strict: true, schema: TIMETABLE_SCHEMA }, verbosity: "low" }
+      })
+    });
+    if (!response.ok) throw new Error(`openai-failed-${response.status}`);
+    const parsed = JSON.parse(textFromResponse(await response.json()));
+    return { courses: Array.isArray(parsed.courses) ? parsed.courses : [], assessments: Array.isArray(parsed.assessments) ? parsed.assessments : [] };
+  } finally { clearTimeout(timeout); }
+}
+\nconst server = http.createServer(async (request, response) => {
   if (request.method === "OPTIONS") { response.writeHead(204, headers()); response.end(); return; }
   if (request.method !== "POST") { send(response, 404, { error: "Route introuvable." }); return; }
   if (rateLimited(request)) { send(response, 429, { error: "Trop de tentatives. Réessaie dans quelques minutes." }); return; }
@@ -217,6 +267,12 @@ const server = http.createServer(async (request, response) => {
       const text = String(payload.text || "").trim(), fileData = payload.fileData;
       if (!text && !fileData) { send(response, 400, { error: "Aucun texte ou PDF reçu." }); return; }
       send(response, 200, { items: await extractTasks(text, payload.today || new Date().toISOString().slice(0, 10), fileData) });
+      return;
+    }
+    if (request.url === "/timetable/analyze") {
+      if (!validTimetableImages(payload.images)) { send(response, 400, { error: "Choisis entre une et douze images de taille raisonnable." }); return; }
+      const analysis = await analyseTimetable(payload.images, payload.kind === "assessments" ? "assessments" : "timetable");
+      send(response, 200, analysis);
       return;
     }
     if (request.url === "/chat") {
