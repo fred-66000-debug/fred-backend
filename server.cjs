@@ -100,6 +100,39 @@ async function extractTasks(sourceText, today, fileData) {
   if (!response.ok) throw new Error("openai-failed");
   return JSON.parse(textFromResponse(await response.json())).items || [];
 }
+function cleanChatHistory(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(-12).map(item => ({
+    role: item && item.role === "assistant" ? "Fred" : "Élève",
+    content: String((item && item.content) || "").replace(/\s+/g, " ").trim().slice(0, 2_000)
+  })).filter(item => item.content);
+}
+async function askFred(message, history) {
+  if (!OPENAI_API_KEY) throw new Error("missing-openai-key");
+  const transcript = cleanChatHistory(history).map(item => `${item.role} : ${item.content}`).join("\n");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 25_000);
+  try {
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        store: false,
+        max_output_tokens: 650,
+        instructions: "Tu es Fred, assistant scolaire français, calme et encourageant. Aide l'élève à comprendre et s'organiser. Ne fais jamais un devoir ou exercice noté à sa place : explique la méthode, donne des indices progressifs et un exemple différent si utile. Ne demande jamais de mot de passe, identifiant, code de connexion ou autre secret. Réponds en français simple et court.",
+        input: [{ role: "user", content: [{ type: "input_text", text: `${transcript ? `Historique récent :\n${transcript}\n\n` : ""}Nouvelle question de l'élève :\n${message}`.slice(0, 45_000) }] }]
+      })
+    });
+    if (!response.ok) throw new Error(`openai-failed-${response.status}`);
+    const reply = textFromResponse(await response.json()).trim();
+    if (!reply) throw new Error("openai-empty-response");
+    return reply;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function isRetryableEcoleDirecteError(error) {
   return /ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|network|timeout|temporarily/i.test(String(error && (error.code || error.message || error)));
@@ -186,6 +219,13 @@ const server = http.createServer(async (request, response) => {
       send(response, 200, { items: await extractTasks(text, payload.today || new Date().toISOString().slice(0, 10), fileData) });
       return;
     }
+    if (request.url === "/chat") {
+      const message = String(payload.message || "").trim();
+      if (!message) { send(response, 400, { error: "Écris une question pour Fred." }); return; }
+      if (message.length > 8_000) { send(response, 413, { error: "Le message est trop long." }); return; }
+      send(response, 200, { reply: await askFred(message, payload.history) });
+      return;
+    }
     if (request.url === "/ecole-directe/sync") {
       const username = String(payload.username || "").trim(), password = String(payload.password || "");
       if (!username || !password) { send(response, 400, { error: "Identifiant et mot de passe requis." }); return; }
@@ -199,6 +239,7 @@ const server = http.createServer(async (request, response) => {
     if (error.message === "choose-student") { send(response, 409, { error: "Choisis un élève.", students: error.students }); return; }
     if (error === "Invalid credentials" || error.message === "Invalid credentials" || error.message === "invalid-credentials") { send(response, 401, { error: "Identifiant ou mot de passe École Directe incorrect." }); return; }
     if (error.message === "ecole-directe-unavailable") { send(response, 503, { error: "École Directe ne répond pas pour le moment. Réessaie dans une minute." }); return; }
+    if (error.message === "missing-openai-key") { send(response, 503, { error: "La clé du service IA manque sur le serveur." }); return; }
     console.error("fred backend error", error.message);
     send(response, 502, { error: "La synchronisation est indisponible. Réessaie dans un instant." });
   }
