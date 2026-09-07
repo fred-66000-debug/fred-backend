@@ -247,7 +247,7 @@ async function analyseTimetable(images, kind) {
       method: "POST", signal: controller.signal,
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: OPENAI_MODEL, store: false, max_output_tokens: 500,
+        model: OPENAI_MODEL, store: false, max_output_tokens: 2200,
         input: [{ role: "user", content: [{ type: "input_text", text: prompt }, ...images.map(image_url => ({ type: "input_image", image_url, detail: "high" }))] }],
         text: { format: { type: "json_schema", name: "fred_timetable", strict: true, schema: TIMETABLE_SCHEMA }, verbosity: "low" }
       })
@@ -296,6 +296,7 @@ const server = http.createServer(async (request, response) => {
     if (error.message === "choose-student") { send(response, 409, { error: "Choisis un élève.", students: error.students }); return; }
     if (error === "Invalid credentials" || error.message === "Invalid credentials" || error.message === "invalid-credentials") { send(response, 401, { error: "Identifiant ou mot de passe École Directe incorrect." }); return; }
     if (error.message === "ecole-directe-unavailable") { send(response, 503, { error: "École Directe ne répond pas pour le moment. Réessaie dans une minute." }); return; }
+    if (error.message === "Unexpected end of JSON input") { send(response, 422, { error: "Photo illisible. Essaie avec une photo nette." }); return; }
     if (error.message === "missing-openai-key") { send(response, 503, { error: "La clé du service IA manque sur le serveur." }); return; }
     console.error("fred backend error", error.message);
     send(response, 502, { error: "La synchronisation est indisponible. Réessaie dans un instant." });
