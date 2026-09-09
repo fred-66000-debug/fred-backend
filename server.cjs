@@ -32,6 +32,7 @@ function send(res, status, body) {
 }
 function rateLimited(request) {
   const ip = String(request.headers["x-forwarded-for"] || request.socket.remoteAddress || "unknown").split(",")[0].trim();
+  for (const [key, value] of attempts) if (Date.now() - value.started > RATE_WINDOW_MS) attempts.delete(key);
   const now = Date.now(), record = attempts.get(ip) || { started: now, count: 0 };
   if (now - record.started > RATE_WINDOW_MS) { record.started = now; record.count = 0; }
   record.count += 1; attempts.set(ip, record);
@@ -39,9 +40,9 @@ function rateLimited(request) {
 }
 function readBody(request) {
   return new Promise((resolve, reject) => {
-    let raw = "";
-    request.on("data", chunk => { raw += chunk; if (raw.length > 15_000_000) request.destroy(); });
-    request.on("end", () => { try { resolve(JSON.parse(raw || "{}")); } catch { reject(new Error("invalid-json")); } });
+    let raw = "", bytes = 0, tooLarge = false;
+    request.on("data", chunk => { bytes += chunk.length; if (bytes > 15_000_000) { tooLarge = true; raw = ""; reject(new Error("body-too-large")); return; } if (!tooLarge) raw += chunk; });
+    request.on("end", () => { if (tooLarge) return; try { resolve(JSON.parse(raw || "{}")); } catch { reject(new Error("invalid-json")); } });
     request.on("error", reject);
   });
 }
@@ -77,7 +78,13 @@ function normalizeSchedule(raw) {
     return { day: (jsDay + 6) % 7, subject: subject.slice(0, 80), start, end };
   }).filter(Boolean);
 }
+function reasoningOptions() {
+  return /^gpt-5/.test(OPENAI_MODEL) ? { reasoning: { effort: "low" } } : {};
+}
 function textFromResponse(response) {
+  if (response.status === "incomplete") throw new Error("openai-incomplete");
+  if (response.error || response.status === "failed") throw new Error("openai-failed-response");
+  if ((response.output || []).some(item => (item.content || []).some(content => content.type === "refusal"))) throw new Error("openai-refusal");
   for (const item of response.output || []) for (const content of item.content || []) if (content.type === "output_text") return content.text || "";
   return "";
 }
@@ -107,12 +114,23 @@ function cleanChatHistory(value) {
     content: String((item && item.content) || "").replace(/\s+/g, " ").trim().slice(0, 2_000)
   })).filter(item => item.content);
 }
-async function askFred(message, history) {
+function validChatImages(images) {
+  if (images === undefined || images === null) return true;
+  if (!Array.isArray(images) || images.length > 3) return false;
+  let total = 0;
+  return images.every(image => {
+    if (typeof image !== "string" || !/^data:image\/(jpeg|png|webp);base64,/i.test(image)) return false;
+    total += image.length;
+    return image.length <= 1_500_000 && total <= 4_500_000;
+  });
+}
+async function askFred(message, history, images = [], context = "") {
   if (!OPENAI_API_KEY) throw new Error("missing-openai-key");
   const transcript = cleanChatHistory(history).map(item => `${item.role} : ${item.content}`).join("\n");
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25_000);
+  const timeout = setTimeout(() => controller.abort(), 60_000);
   try {
+    const content = [{ type: "input_text", text: `${transcript ? `Historique récent :\n${transcript}\n\n` : ""}Contexte scolaire utile :\n${String(context || "").slice(0, 6_000)}\n\nNouvelle question de l'élève :\n${message}`.slice(0, 45_000) }, ...images.map(image_url => ({ type: "input_image", image_url, detail: "high" }))];
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
@@ -120,9 +138,10 @@ async function askFred(message, history) {
       body: JSON.stringify({
         model: OPENAI_MODEL,
         store: false,
-        max_output_tokens: 650,
+        max_output_tokens: 4000,
+        ...reasoningOptions(),
         instructions: "Tu es Fred, assistant scolaire français, calme et encourageant. Aide l'élève à comprendre et s'organiser. Ne fais jamais un devoir ou exercice noté à sa place : explique la méthode, donne des indices progressifs et un exemple différent si utile. Ne demande jamais de mot de passe, identifiant, code de connexion ou autre secret. Réponds en français simple et court.",
-        input: [{ role: "user", content: [{ type: "input_text", text: `${transcript ? `Historique récent :\n${transcript}\n\n` : ""}Nouvelle question de l'élève :\n${message}`.slice(0, 45_000) }] }]
+        input: [{ role: "user", content }]
       })
     });
     if (!response.ok) throw new Error(`openai-failed-${response.status}`);
@@ -132,6 +151,32 @@ async function askFred(message, history) {
   } finally {
     clearTimeout(timeout);
   }
+}
+const FLASHCARD_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["cards"], properties: { cards: { type: "array", maxItems: 40, items: {
+    type: "object", additionalProperties: false, required: ["question", "answer"], properties: {
+      question: { type: "string", minLength: 1, maxLength: 220 }, answer: { type: "string", minLength: 1, maxLength: 500 }
+    }
+  } } }
+};
+async function generateFlashcards(images) {
+  if (!OPENAI_API_KEY) throw new Error("missing-openai-key");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60_000);
+  try {
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST", signal: controller.signal,
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: OPENAI_MODEL, store: false, max_output_tokens: 8000, ...reasoningOptions(),
+        instructions: "Tu transformes une feuille de cours en fiches de révision en français. Crée des questions courtes et des réponses exactes uniquement à partir du cours visible. N'invente rien, ne fais pas les exercices à la place de l'élève. Les fiches doivent aider au rappel actif et rester compréhensibles.",
+        input: [{ role: "user", content: [{ type: "input_text", text: "Crée des fiches question/réponse à partir de ces pages de cours." }, ...images.map(image_url => ({ type: "input_image", image_url, detail: "high" }))] }],
+        text: { format: { type: "json_schema", name: "fred_flashcards", strict: true, schema: FLASHCARD_SCHEMA }, verbosity: "low" }
+      })
+    });
+    if (!response.ok) throw new Error(`openai-failed-${response.status}`);
+    return JSON.parse(textFromResponse(await response.json())).cards || [];
+  } finally { clearTimeout(timeout); }
 }
 function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function isRetryableEcoleDirecteError(error) {
@@ -238,7 +283,7 @@ function validTimetableImages(images) {
 async function analyseTimetable(images, kind) {
   if (!OPENAI_API_KEY) throw new Error("missing-openai-key");
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25_000);
+  const timeout = setTimeout(() => controller.abort(), 60_000);
   try {
     const prompt = kind === "assessments"
       ? "Lis uniquement le planning de devoirs surveillés ou contrôles. Retourne chaque DS dans assessments, avec matière, date affichée telle qu'elle est écrite et détail éventuel. Ne remplis pas courses. N'invente jamais une date ou matière absente."
@@ -247,7 +292,7 @@ async function analyseTimetable(images, kind) {
       method: "POST", signal: controller.signal,
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: OPENAI_MODEL, store: false, max_output_tokens: 2200,
+        model: OPENAI_MODEL, store: false, max_output_tokens: 12000, ...reasoningOptions(),
         input: [{ role: "user", content: [{ type: "input_text", text: prompt }, ...images.map(image_url => ({ type: "input_image", image_url, detail: "high" }))] }],
         text: { format: { type: "json_schema", name: "fred_timetable", strict: true, schema: TIMETABLE_SCHEMA }, verbosity: "low" }
       })
@@ -260,6 +305,7 @@ async function analyseTimetable(images, kind) {
 
 const server = http.createServer(async (request, response) => {
   if (request.method === "OPTIONS") { response.writeHead(204, headers()); response.end(); return; }
+  if (request.method === "GET" && request.url === "/health") { send(response, 200, { ok: true, service: "fred-backend", version: "guided-study-20260909", capabilities: ["chat-images", "flashcards", "timetable", "assessments"] }); return; }
   if (request.method !== "POST") { send(response, 404, { error: "Route introuvable." }); return; }
   if (rateLimited(request)) { send(response, 429, { error: "Trop de tentatives. Réessaie dans quelques minutes." }); return; }
   try {
@@ -280,7 +326,13 @@ const server = http.createServer(async (request, response) => {
       const message = String(payload.message || "").trim();
       if (!message) { send(response, 400, { error: "Écris une question pour Fred." }); return; }
       if (message.length > 8_000) { send(response, 413, { error: "Le message est trop long." }); return; }
-      send(response, 200, { reply: await askFred(message, payload.history) });
+      if (!validChatImages(payload.images)) { send(response, 400, { error: "Les photos doivent être des images JPEG, PNG ou WebP de taille raisonnable." }); return; }
+      send(response, 200, { reply: await askFred(message, payload.history, payload.images || [], payload.context || "") });
+      return;
+    }
+    if (request.url === "/flashcards") {
+      if (!Array.isArray(payload.images) || !validChatImages(payload.images) || !payload.images.length) { send(response, 400, { error: "Choisis au moins une photo de cours." }); return; }
+      send(response, 200, { cards: await generateFlashcards(payload.images) });
       return;
     }
     if (request.url === "/ecole-directe/sync") {
@@ -296,10 +348,17 @@ const server = http.createServer(async (request, response) => {
     if (error.message === "choose-student") { send(response, 409, { error: "Choisis un élève.", students: error.students }); return; }
     if (error === "Invalid credentials" || error.message === "Invalid credentials" || error.message === "invalid-credentials") { send(response, 401, { error: "Identifiant ou mot de passe École Directe incorrect." }); return; }
     if (error.message === "ecole-directe-unavailable") { send(response, 503, { error: "École Directe ne répond pas pour le moment. Réessaie dans une minute." }); return; }
-    if (error.message === "Unexpected end of JSON input") { send(response, 422, { error: "Photo illisible. Essaie avec une photo nette." }); return; }
+    if (error.name === "AbortError" || error.name === "TimeoutError") { send(response, 504, { error: "Fred a mis trop de temps à répondre. Réessaie avec une seule page : ta sélection reste dans l’app." }); return; }
+    if (error.message === "openai-incomplete" || error instanceof SyntaxError || error.message === "openai-empty-response") { send(response, 422, { error: "L’analyse est arrivée incomplète. Essaie une page à la fois ; ce n’est pas forcément un problème de photo." }); return; }
+    if (error.message === "openai-failed-429") { send(response, 503, { error: "Le service IA a atteint sa limite ou ses crédits. Vérifie la facturation du projet API." }); return; }
+    if (error.message === "openai-failed-401") { send(response, 503, { error: "La clé IA du serveur doit être vérifiée par le responsable de FRED." }); return; }
+    if (error.message === "openai-refusal") { send(response, 422, { error: "Fred ne peut pas analyser ce document. Essaie une autre page de cours." }); return; }
+    if (error.message === "body-too-large") { send(response, 413, { error: "Photos trop lourdes. Choisis moins de pages." }); return; }
+    if (error.message === "invalid-json") { send(response, 400, { error: "La demande reçue est invalide." }); return; }
     if (error.message === "missing-openai-key") { send(response, 503, { error: "La clé du service IA manque sur le serveur." }); return; }
-    console.error("fred backend error", error.message);
-    send(response, 502, { error: "La synchronisation est indisponible. Réessaie dans un instant." });
+    console.error("fred backend error", String(error.message || "unknown").slice(0, 120));
+    send(response, 502, { error: "Le service Fred est indisponible. Tes données restent dans l’app ; réessaie dans un instant." });
   }
 });
-server.listen(PORT, () => console.log(`fred backend listening on ${PORT}`));
+if (require.main === module) server.listen(PORT, "0.0.0.0", () => console.log(`fred backend listening on ${PORT}`));
+module.exports = { server, textFromResponse, validChatImages, validTimetableImages, askFred, generateFlashcards, analyseTimetable };
